@@ -13,11 +13,14 @@ import (
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
+	"github.com/grafana/grafana/pkg/components/simplejson"
 	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/models"
 	"github.com/grafana/grafana/pkg/plugins"
+	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/tsdb/interval"
 	"xorm.io/core"
 	"xorm.io/xorm"
@@ -31,7 +34,7 @@ var ErrConnectionFailed = errors.New("failed to connect to server - please inspe
 // SQLMacroEngine interpolates macros into sql. It takes in the Query to have access to query context and
 // timeRange to be able to generate queries that use from and to.
 type SQLMacroEngine interface {
-	Interpolate(query plugins.DataSubQuery, timeRange backend.TimeRange, sql string) (string, error)
+	Interpolate(query backend.DataQuery, timeRange backend.TimeRange, sql string) (string, error)
 }
 
 // SqlQueryResultTransformer transforms a query result row to RowValues with proper types.
@@ -53,6 +56,25 @@ var engineCache = engineCacheType{
 	versions: make(map[int64]int),
 }
 
+type DatasourceInfo struct {
+	datasourceID           int64
+	timescaledb            bool
+	uid                    string
+	database               string
+	url                    string
+	user                   string
+	password               string
+	sslmode                string
+	tlsConfigurationMethod string
+	tlsCACert              string
+	tlsClientCert          string
+	tlsClientKey           string
+	sslRootCertFile        string
+	sslCertFile            string
+	sslKeyFile             string
+	updated                time.Time
+}
+
 var sqlIntervalCalculator = interval.NewCalculator()
 
 // NewXormEngine is an xorm.Engine factory, that can be stubbed by tests.
@@ -68,6 +90,8 @@ type dataPlugin struct {
 	timeColumnNames        []string
 	metricColumnTypes      []string
 	log                    log.Logger
+	cfg                    *setting.Cfg
+	im                     instancemgmt.InstanceManager
 }
 
 type DataPluginConfiguration struct {
@@ -92,10 +116,8 @@ func (e *dataPlugin) transformQueryError(err error) error {
 	return e.queryResultTransformer.TransformQueryError(err)
 }
 
-// NewDataPlugin returns a new plugins.DataPlugin
-//nolint: staticcheck // plugins.DataPlugin deprecated
-func NewDataPlugin(config DataPluginConfiguration, queryResultTransformer SqlQueryResultTransformer,
-	macroEngine SQLMacroEngine, log log.Logger) (plugins.DataPlugin, error) {
+func NewQueryDataHandler(config DataPluginConfiguration, queryResultTransformer SqlQueryResultTransformer,
+	macroEngine SQLMacroEngine, log log.Logger) (backend.QueryDataHandler, error) {
 	plugin := dataPlugin{
 		queryResultTransformer: queryResultTransformer,
 		macroEngine:            macroEngine,
@@ -140,6 +162,10 @@ func NewDataPlugin(config DataPluginConfiguration, queryResultTransformer SqlQue
 	return &plugin, nil
 }
 
+func (e *dataPlugin) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
+	return nil, nil
+}
+
 const rowLimit = 1000000
 
 // DataQuery queries for data.
@@ -165,14 +191,14 @@ func (e *dataPlugin) DataQuery(ctx context.Context, dsInfo *models.DataSource,
 	close(ch)
 	result.Responses = make(map[string]backend.DataResponse)
 	for queryResult := range ch {
-		result.Responses[queryResult.RefID] = queryResult
+		result.Responses[queryContext.RefID] = queryResult
 	}
 
 	return result, nil
 }
 
 //nolint: staticcheck // plugins.DataQueryResult deprecated
-func (e *dataPlugin) executeQuery(query plugins.DataSubQuery, wg *sync.WaitGroup, queryContext backend.DataQuery,
+func (e *dataPlugin) executeQuery(query backend.DataQuery, wg *sync.WaitGroup, queryContext backend.DataQuery,
 	ch chan backend.DataResponse) {
 	defer wg.Done()
 	queryResult := backend.DataResponse{}
@@ -194,8 +220,13 @@ func (e *dataPlugin) executeQuery(query plugins.DataSubQuery, wg *sync.WaitGroup
 			ch <- queryResult
 		}
 	}()
-
-	rawSQL := query.Model.Get("rawSql").MustString()
+	model, err := simplejson.NewJson(query.JSON)
+	if err != nil {
+		queryResult.Error = err
+		ch <- queryResult
+		return
+	}
+	rawSQL := model.Get("rawSql").MustString()
 	if rawSQL == "" {
 		panic("Query model property rawSql should not be empty at this point")
 	}
@@ -868,27 +899,32 @@ func convertSQLValueColumnToFloat(frame *data.Frame, Index int) (*data.Frame, er
 		return frame, fmt.Errorf("metricIndex %d type can't be converted to float", Index)
 	}
 	frame.Fields[Index] = newField
-
 	return frame, nil
 }
 
-func SetupFillmode(query plugins.DataSubQuery, interval time.Duration, fillmode string) error {
-	query.Model.Set("fill", true)
-	query.Model.Set("fillInterval", interval.Seconds())
+func SetupFillmode(query *backend.DataQuery, interval time.Duration, fillmode string) error {
+	model, err := simplejson.NewJson(query.JSON)
+	if err != nil {
+		return err
+	}
+	model.Set("fill", true)
+	model.Set("fillInterval", interval.Seconds())
 	switch fillmode {
 	case "NULL":
-		query.Model.Set("fillMode", "null")
+		model.Set("fillMode", "null")
 	case "previous":
-		query.Model.Set("fillMode", "previous")
+		model.Set("fillMode", "previous")
 	default:
-		query.Model.Set("fillMode", "value")
+		model.Set("fillMode", "value")
 		floatVal, err := strconv.ParseFloat(fillmode, 64)
 		if err != nil {
 			return fmt.Errorf("error parsing fill value %v", fillmode)
 		}
-		query.Model.Set("fillValue", floatVal)
+		model.Set("fillValue", floatVal)
 	}
-
+	if query.JSON, err = model.MarshalJSON(); err != nil {
+		return err
+	}
 	return nil
 }
 
